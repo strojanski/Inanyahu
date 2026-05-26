@@ -72,9 +72,9 @@ X_bin = csr_matrix(
     (np.ones(len(row_idx), np.float32), (row_idx, col_idx)), shape=(N, D)
 )
 
-# (a) frequency-weighted + L2 normalise (no SVD)
+# (a) inverse frequency-weighted + L2 normalise (no SVD)
 df_vec   = np.asarray(X_bin.sum(axis=0)).flatten()
-X_freq   = 1 - normalize(X_bin.multiply(df_vec), norm="l2")   # sparse (N, D)
+X_freq   = np.ones((N, D), dtype=np.float32) - normalize(X_bin.multiply(df_vec), norm="l2")   # sparse (N, D)
 
 # (b) frequency-weighted + L2 + SVD-128
 svd      = TruncatedSVD(n_components=SVD_DIM, random_state=SEED)
