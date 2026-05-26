@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Node classification on LastFM-Asia using GraphSAGE.
+Node classification on LastFM-Asia using GCN and GraphSAGE.
 
-Features: frequency-weighted + L2 + SVD-128
+Features: inverse-frequency-weighted + L2 + SVD-2048
 
 Usage:
     python train_gnn.py
@@ -11,7 +11,7 @@ Usage:
 import json, time
 import numpy as np
 import pandas as pd
-from scipy.sparse import csr_matrix, diags
+from scipy.sparse import csr_matrix, diags, eye
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import normalize
 from sklearn.decomposition import TruncatedSVD
@@ -82,6 +82,11 @@ src = np.concatenate([edges["node_1"].values, edges["node_2"].values])
 dst = np.concatenate([edges["node_2"].values, edges["node_1"].values])
 A   = csr_matrix((np.ones(len(src), np.float32), (src, dst)), shape=(N, N))
 
+A_gcn  = (A + eye(N, format="csr")).astype(np.float32)
+deg    = np.asarray(A_gcn.sum(1)).flatten()
+Drt    = diags(1.0 / np.sqrt(deg), dtype=np.float32)
+A_hat  = (Drt @ A_gcn @ Drt).astype(np.float32)         # GCN symmetric norm
+
 deg2   = np.asarray(A.sum(1)).flatten(); deg2[deg2 == 0] = 1.0
 A_sage = (diags(1.0 / deg2, dtype=np.float32) @ A).astype(np.float32)  # SAGE row norm
 
@@ -139,7 +144,37 @@ class Adam:
             v_hat = self._v[name] / bc2
             param -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps) + self.lr * self.wd * param
 
-# --- 7. GraphSAGE ------------------------------------------------------------
+# --- 7. GCN ------------------------------------------------------------------
+class GCN:
+    """2-layer GCN. Accepts precomputed AX = A_hat @ X (fixed)."""
+    def __init__(self, AX_pre, in_dim):
+        self.AX  = AX_pre
+        self.W1  = (rng.standard_normal((in_dim, HIDDEN)) * np.sqrt(2.0 / in_dim)).astype(np.float32)
+        self.W2  = (rng.standard_normal((HIDDEN, C))      * np.sqrt(2.0 / HIDDEN)).astype(np.float32)
+        self.opt = Adam(lr=LR, wd=WD)
+
+    def forward(self, training=False):
+        self._Z1     = self.AX @ self.W1
+        H1           = np.maximum(0.0, self._Z1)
+        H1, self._dm = dropout_fwd(H1, DROPOUT, training)
+        self._H1     = H1
+        AH1          = np.asarray(A_hat @ H1, dtype=np.float32)
+        self._AH1    = AH1
+        return softmax(AH1 @ self.W2)
+
+    def backward(self, probs):
+        n   = int(tr.sum())
+        dZ2 = np.zeros((N, C), np.float32)
+        d   = probs[tr].copy(); d[np.arange(n), labels[tr]] -= 1.0; d /= n
+        dZ2[tr] = d
+        dW2     = self._AH1.T @ dZ2
+        dH1     = np.asarray(A_hat @ (dZ2 @ self.W2.T), dtype=np.float32)
+        dH1_raw = dropout_bwd(dH1, self._dm, DROPOUT)
+        dZ1     = dH1_raw * (self._Z1 > 0).astype(np.float32)
+        dW1     = self.AX.T @ dZ1
+        self.opt.step({"W1": (self.W1, dW1), "W2": (self.W2, dW2)})
+
+# --- 8. GraphSAGE ------------------------------------------------------------
 class GraphSAGE:
     """
     2-layer GraphSAGE (mean aggregator, concat self + neighbours).
@@ -225,55 +260,67 @@ def evaluate_probs(probs, model_name, feat_name, print_report=False):
         print(classification_report(true, pred, zero_division=0))
     return pred, mf1, acc
 
-# --- 9. Run GraphSAGE --------------------------------------------------------
+# --- 10. Bootstrap helper -----------------------------------------------------
+def bootstrap(pred_arr, true_arr, n_boot=2000):
+    n = len(true_arr)
+    ba, bf = np.empty(n_boot), np.empty(n_boot)
+    for i in range(n_boot):
+        idx  = rng.integers(0, n, size=n)
+        ba[i] = (pred_arr[idx] == true_arr[idx]).mean()
+        bf[i] = f1_score(true_arr[idx], pred_arr[idx], average="macro", zero_division=0)
+    ci_a = np.percentile(ba, [2.5, 97.5])
+    ci_f = np.percentile(bf, [2.5, 97.5])
+    print(f"  Bootstrap 95% CI")
+    print(f"  Accuracy : {ba.mean():.4f}  [{ci_a[0]:.4f}, {ci_a[1]:.4f}]  (±{(ci_a[1]-ci_a[0])/2:.4f})")
+    print(f"  Macro-F1 : {bf.mean():.4f}  [{ci_f[0]:.4f}, {ci_f[1]:.4f}]  (±{(ci_f[1]-ci_f[0])/2:.4f})")
+
+# --- 11. Run GCN --------------------------------------------------------------
 print("\n" + "="*60)
-print("  GraphSAGE  (freq+L2->SVD-128)")
+print("  GCN  (freq+L2->SVD-2048)")
+print("="*60)
+
+AX_pre = np.asarray(A_hat @ X_svd, dtype=np.float32)
+gcn    = GCN(AX_pre, in_dim=SVD_DIM)
+hist_gcn = train_model(gcn, "GCN")
+probs_gcn = gcn.forward(training=False)
+pred_gcn, mf1_gcn, acc_gcn = evaluate_probs(probs_gcn, "GCN", "freq_svd2048", print_report=True)
+bootstrap(pred_gcn, labels[te])
+
+# --- 12. Run GraphSAGE --------------------------------------------------------
+print("\n" + "="*60)
+print("  GraphSAGE  (freq+L2->SVD-2048)")
 print("="*60)
 
 AX_s = np.asarray(A_sage @ X_svd, dtype=np.float32)
 AGG1 = np.hstack([X_svd, AX_s]).astype(np.float32)
 sage = GraphSAGE(AGG1, in_dim=SVD_DIM)
-hist = train_model(sage, "GraphSAGE")
-probs = sage.forward(training=False)
-pred, mf1, acc = evaluate_probs(probs, "GraphSAGE", "freq_svd128", print_report=True)
+hist_sage = train_model(sage, "GraphSAGE")
+probs_sage = sage.forward(training=False)
+pred_sage, mf1_sage, acc_sage = evaluate_probs(probs_sage, "GraphSAGE", "freq_svd2048", print_report=True)
+bootstrap(pred_sage, labels[te])
 
-# --- 10. Bootstrap confidence intervals --------------------------------------
-N_BOOT   = 2000
-true_te  = labels[te]
-n_te     = len(true_te)
-boot_acc, boot_f1 = np.empty(N_BOOT), np.empty(N_BOOT)
-for i in range(N_BOOT):
-    idx = rng.integers(0, n_te, size=n_te)
-    boot_acc[i] = (pred[idx] == true_te[idx]).mean()
-    boot_f1[i]  = f1_score(true_te[idx], pred[idx], average="macro", zero_division=0)
-
-ci_acc = np.percentile(boot_acc, [2.5, 97.5])
-ci_f1  = np.percentile(boot_f1,  [2.5, 97.5])
-print(f"\n  Bootstrap (n={N_BOOT})  95% CI")
-print(f"  Accuracy : {boot_acc.mean():.4f}  [{ci_acc[0]:.4f}, {ci_acc[1]:.4f}]"
-      f"  (±{(ci_acc[1]-ci_acc[0])/2:.4f})")
-print(f"  Macro-F1 : {boot_f1.mean():.4f}  [{ci_f1[0]:.4f}, {ci_f1[1]:.4f}]"
-      f"  (±{(ci_f1[1]-ci_f1[0])/2:.4f})")
-
-# --- 11. Plots ---------------------------------------------------------------
+# --- 13. Plots ----------------------------------------------------------------
 print("\n--- Generating plots")
 
 fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-axes[0].plot(hist["loss"])
-axes[1].plot(hist["val_f1"])
+for hist, label in [(hist_gcn, "GCN"), (hist_sage, "GraphSAGE")]:
+    axes[0].plot(hist["loss"],   label=label)
+    axes[1].plot(hist["val_f1"], label=label)
 axes[0].set(title="Training loss", xlabel="Epoch", ylabel="Loss")
 axes[1].set(title="Val macro-F1",  xlabel="Epoch", ylabel="Macro-F1")
 for ax in axes:
-    ax.grid(alpha=0.3)
+    ax.legend(); ax.grid(alpha=0.3)
 plt.tight_layout()
-plt.savefig("training_graphsage.png", dpi=110); plt.close()
-print("  Saved: training_graphsage.png")
+plt.savefig("training_curves.png", dpi=110); plt.close()
+print("  Saved: training_curves.png")
 
-cm = confusion_matrix(labels[te], pred)
-fig, ax = plt.subplots(figsize=(9, 7))
-sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax,
-            linewidths=0.3, cbar_kws={"label": "Count"})
-ax.set(xlabel="Predicted", ylabel="True", title="GraphSAGE [freq_svd128] - Confusion Matrix")
-plt.tight_layout()
-plt.savefig("confusion_graphsage.png", dpi=110); plt.close()
-print("  Saved: confusion_graphsage.png")
+for pred_arr, name in [(pred_gcn, "gcn"), (pred_sage, "graphsage")]:
+    cm = confusion_matrix(labels[te], pred_arr)
+    fig, ax = plt.subplots(figsize=(9, 7))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax,
+                linewidths=0.3, cbar_kws={"label": "Count"})
+    ax.set(xlabel="Predicted", ylabel="True",
+           title=f"{name.upper()} - Confusion Matrix")
+    plt.tight_layout()
+    plt.savefig(f"confusion_{name}.png", dpi=110); plt.close()
+    print(f"  Saved: confusion_{name}.png")
